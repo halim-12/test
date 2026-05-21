@@ -56,6 +56,21 @@ HORIZONS = [1, 2, 3, 4, 8]
 FIRST_FORECAST_ORIGIN = pd.Period("2012Q4", freq="Q")
 ROBUSTNESS_FORECAST_ORIGIN = pd.Period("2014Q4", freq="Q")
 
+DEFAULT_GIBBS_N_ITER_RECURSIVE = 1200
+DEFAULT_GIBBS_BURN_RECURSIVE = 400
+DEFAULT_GIBBS_THIN_RECURSIVE = 2
+DEFAULT_GIBBS_TRAJECTORIES_RECURSIVE = 3
+DEFAULT_GIBBS_N_ITER_FINAL = 3000
+DEFAULT_GIBBS_BURN_FINAL = 1000
+DEFAULT_GIBBS_THIN_FINAL = 2
+DEFAULT_GIBBS_TRAJECTORIES_FINAL = 10
+
+# Kim, Shephard, and Chib seven-component approximation to log(chi-square_1).
+# The tabulated means are shifted by -1.2704 for log(epsilon^2).
+KSC_MIXTURE_WEIGHTS = np.array([0.00730, 0.10556, 0.00002, 0.04395, 0.34001, 0.24566, 0.25750])
+KSC_MIXTURE_MEANS = np.array([-10.12999, -3.97281, -8.56686, 2.77786, 0.61942, 1.79518, -1.08819]) - 1.2704
+KSC_MIXTURE_VARIANCES = np.array([5.79596, 2.61369, 5.17950, 0.16735, 0.64009, 0.34023, 1.26261])
+
 DATA_SPECS = [
     {
         "variable": "eci_wage",
@@ -512,6 +527,663 @@ def estimate_stochastic_volatility_state(residuals, alpha: float = 0.15):
     }
 
 
+def symmetrize(matrix):
+    matrix = np.asarray(matrix, dtype=float)
+    return 0.5 * (matrix + matrix.T)
+
+
+def ensure_positive_definite(matrix, min_eig: float = 1e-10):
+    matrix = symmetrize(matrix)
+    values, vectors = np.linalg.eigh(matrix)
+    values = np.maximum(values, min_eig)
+    return symmetrize((vectors * values) @ vectors.T)
+
+
+def cholesky_psd(matrix, *, jitter: float = 1e-10, max_tries: int = 7, diagnostics: dict | None = None):
+    matrix = symmetrize(matrix)
+    eye = np.eye(matrix.shape[0])
+    current_jitter = 0.0
+    for attempt in range(max_tries):
+        try:
+            chol = np.linalg.cholesky(matrix + current_jitter * eye)
+            if attempt > 0 and diagnostics is not None:
+                diagnostics["cholesky_jitter_events"] = diagnostics.get("cholesky_jitter_events", 0) + 1
+            return chol
+        except np.linalg.LinAlgError:
+            current_jitter = jitter * (10.0**attempt)
+    if diagnostics is not None:
+        diagnostics["cholesky_jitter_events"] = diagnostics.get("cholesky_jitter_events", 0) + 1
+    repaired = ensure_positive_definite(matrix, min_eig=max(current_jitter, jitter))
+    return np.linalg.cholesky(repaired)
+
+
+def draw_mvn_cov(mean, covariance, rng, diagnostics: dict | None = None):
+    mean = np.asarray(mean, dtype=float)
+    chol = cholesky_psd(covariance, diagnostics=diagnostics)
+    return mean + chol @ rng.standard_normal(len(mean))
+
+
+def draw_mvn_precision(mean, precision, rng, diagnostics: dict | None = None):
+    mean = np.asarray(mean, dtype=float)
+    chol = cholesky_psd(precision, diagnostics=diagnostics)
+    return mean + np.linalg.solve(chol.T, rng.standard_normal(len(mean)))
+
+
+def inverse_wishart_draw(df: float, scale, rng, diagnostics: dict | None = None):
+    scale = ensure_positive_definite(scale)
+    n = scale.shape[0]
+    inv_scale = np.linalg.inv(scale)
+    chol = cholesky_psd(inv_scale, diagnostics=diagnostics)
+    bartlett = np.zeros((n, n))
+    for i in range(n):
+        bartlett[i, i] = math.sqrt(rng.chisquare(df - i))
+        for j in range(i):
+            bartlett[i, j] = rng.standard_normal()
+    wishart = chol @ bartlett @ bartlett.T @ chol.T
+    out = np.linalg.inv(ensure_positive_definite(wishart))
+    return ensure_positive_definite(out)
+
+
+def build_adaptive_minnesota_prior(
+    n_vars: int,
+    p: int,
+    residual_variances: np.ndarray,
+    kappa_1: float,
+    kappa_2: float,
+    *,
+    intercept_sd: float = 20.0,
+    use_scale: bool = True,
+):
+    k = 1 + n_vars * p
+    beta0 = np.zeros(k * n_vars)
+    v0_diag = np.zeros(k * n_vars)
+    residual_variances = np.maximum(np.asarray(residual_variances, dtype=float), 1e-8)
+    for equation_index in range(n_vars):
+        offset = equation_index * k
+        v0_diag[offset] = intercept_sd**2
+        for lag in range(1, p + 1):
+            for variable_index in range(n_vars):
+                reg_index = 1 + (lag - 1) * n_vars + variable_index
+                if variable_index == equation_index:
+                    variance = kappa_1 / (lag**2)
+                else:
+                    scale = residual_variances[equation_index] / residual_variances[variable_index] if use_scale else 1.0
+                    variance = kappa_2 * scale / (lag**2)
+                v0_diag[offset + reg_index] = variance
+    return beta0, np.maximum(v0_diag, 1e-12)
+
+
+def log_adaptive_minnesota_prior_density(
+    beta,
+    n_vars: int,
+    p: int,
+    residual_variances: np.ndarray,
+    kappa_1: float,
+    kappa_2: float,
+    *,
+    theta_prior_sd: float = 0.75,
+    use_scale: bool = True,
+):
+    if not (np.isfinite(kappa_1) and np.isfinite(kappa_2)) or kappa_1 <= 0.0 or kappa_2 <= 0.0:
+        return -np.inf
+    theta = np.log([kappa_1, kappa_2])
+    theta_mean = np.log([0.1, 0.005])
+    log_theta_prior = -0.5 * np.sum(((theta - theta_mean) / theta_prior_sd) ** 2)
+    _, v0_diag = build_adaptive_minnesota_prior(
+        n_vars,
+        p,
+        residual_variances,
+        kappa_1,
+        kappa_2,
+        use_scale=use_scale,
+    )
+    beta = np.asarray(beta, dtype=float)
+    return float(log_theta_prior - 0.5 * np.sum(np.log(v0_diag) + (beta**2) / v0_diag))
+
+
+def draw_kappa_given_B(
+    B,
+    residual_variances: np.ndarray,
+    current_kappa: np.ndarray,
+    rng,
+    *,
+    p: int,
+    proposal_sd=None,
+    use_scale: bool = True,
+):
+    n_vars = B.shape[1]
+    beta = B.reshape(-1, order="F")
+    current_kappa = np.maximum(np.asarray(current_kappa, dtype=float), 1e-12)
+    proposal_sd = np.asarray([0.10, 0.10] if proposal_sd is None else proposal_sd, dtype=float)
+    current_theta = np.log(current_kappa)
+    proposed_theta = current_theta + proposal_sd * rng.standard_normal(2)
+    proposed_kappa = np.exp(proposed_theta)
+    current_logpost = log_adaptive_minnesota_prior_density(
+        beta,
+        n_vars,
+        p,
+        residual_variances,
+        current_kappa[0],
+        current_kappa[1],
+        use_scale=use_scale,
+    )
+    proposed_logpost = log_adaptive_minnesota_prior_density(
+        beta,
+        n_vars,
+        p,
+        residual_variances,
+        proposed_kappa[0],
+        proposed_kappa[1],
+        use_scale=use_scale,
+    )
+    if math.log(rng.random()) < proposed_logpost - current_logpost:
+        return proposed_kappa, True
+    return current_kappa, False
+
+
+def initialize_am_bvar_sv(
+    train_df: pd.DataFrame,
+    p: int = P_LAGS,
+    variables=None,
+    *,
+    ridge: float = 1e-6,
+):
+    variables = list(VAR_ORDER if variables is None else variables)
+    y = train_df[variables].dropna(how="any").to_numpy(dtype=float)
+    x, target = make_lagged_xy(y, p)
+    k = x.shape[1]
+    n = target.shape[1]
+    penalty = ridge * np.eye(k)
+    penalty[0, 0] = 0.0
+    B = np.linalg.solve(x.T @ x + penalty, x.T @ target)
+    U = target - x @ B
+    A = np.eye(n)
+    for i in range(1, n):
+        XA = -U[:, :i]
+        yA = U[:, i]
+        try:
+            coef = np.linalg.solve(XA.T @ XA + ridge * np.eye(i), XA.T @ yA)
+        except np.linalg.LinAlgError:
+            coef = np.zeros(i)
+        A[i, :i] = coef
+    E = U @ A.T
+    structural_variances = np.maximum(np.nanvar(E, axis=0, ddof=1), 1e-6)
+    H = np.tile(np.log(structural_variances), (target.shape[0], 1))
+    Phi = 0.05 * np.eye(n)
+    residual_variances = ar_residual_variances(y, p=p)
+    return {
+        "variables": variables,
+        "y_raw": y,
+        "x": x,
+        "target": target,
+        "periods": train_df[variables].dropna(how="any").index[p:],
+        "B": B,
+        "A": A,
+        "H": H,
+        "Phi": Phi,
+        "kappa": np.array([0.1, 0.005], dtype=float),
+        "residual_variances": residual_variances,
+    }
+
+
+def draw_B_given_A_H_kappa(
+    X,
+    Y,
+    A,
+    H,
+    kappa,
+    residual_variances: np.ndarray,
+    rng,
+    *,
+    p: int,
+    use_adaptive_minnesota: bool = True,
+    diagnostics: dict | None = None,
+):
+    T, k = X.shape
+    n = Y.shape[1]
+    kappa_1, kappa_2 = (float(kappa[0]), float(kappa[1])) if use_adaptive_minnesota else (0.1, 0.005)
+    beta0, v0_diag = build_adaptive_minnesota_prior(
+        n,
+        p,
+        residual_variances,
+        kappa_1,
+        kappa_2,
+        use_scale=True,
+    )
+    precision = np.diag(1.0 / v0_diag)
+    rhs = beta0 / v0_diag
+    for t in range(T):
+        inv_lambda = np.exp(np.clip(-H[t], -50.0, 50.0))
+        sigma_inv = A.T @ (inv_lambda[:, None] * A)
+        xx = np.outer(X[t], X[t])
+        precision += np.kron(sigma_inv, xx)
+        rhs += np.kron(sigma_inv @ Y[t], X[t])
+    precision = ensure_positive_definite(precision)
+    beta_mean = np.linalg.solve(precision, rhs)
+    beta_draw = draw_mvn_precision(beta_mean, precision, rng, diagnostics=diagnostics)
+    return beta_draw.reshape((k, n), order="F")
+
+
+def draw_A_given_B_H(
+    X,
+    Y,
+    B,
+    H,
+    rng,
+    *,
+    prior_variance: float = 100.0,
+    diagnostics: dict | None = None,
+):
+    U = Y - X @ B
+    n = U.shape[1]
+    A = np.eye(n)
+    for i in range(1, n):
+        XA = -U[:, :i]
+        yA = U[:, i]
+        weights = np.exp(np.clip(-H[:, i], -50.0, 50.0))
+        sqrt_w = np.sqrt(weights)
+        Xw = XA * sqrt_w[:, None]
+        yw = yA * sqrt_w
+        prior_precision = np.eye(i) / prior_variance
+        precision = prior_precision + Xw.T @ Xw
+        rhs = Xw.T @ yw
+        mean = np.linalg.solve(ensure_positive_definite(precision), rhs)
+        covariance = np.linalg.inv(ensure_positive_definite(precision))
+        A[i, :i] = draw_mvn_cov(mean, covariance, rng, diagnostics=diagnostics)
+    return A
+
+
+def draw_sv_mixture_indicators(E, H, rng, *, small_constant: float = 1e-8):
+    E = np.asarray(E, dtype=float)
+    H = np.asarray(H, dtype=float)
+    z = np.log(E**2 + small_constant)
+    means = KSC_MIXTURE_MEANS
+    variances = KSC_MIXTURE_VARIANCES
+    log_weights = (
+        np.log(KSC_MIXTURE_WEIGHTS)[None, None, :]
+        - 0.5 * np.log(variances)[None, None, :]
+        - 0.5 * ((z[:, :, None] - H[:, :, None] - means[None, None, :]) ** 2) / variances[None, None, :]
+    )
+    log_weights -= np.max(log_weights, axis=2, keepdims=True)
+    weights = np.exp(log_weights)
+    weights /= weights.sum(axis=2, keepdims=True)
+    cumulative = np.cumsum(weights, axis=2)
+    uniforms = rng.random(size=E.shape)
+    indicators = (uniforms[:, :, None] > cumulative).sum(axis=2)
+    mixture_means = means[indicators]
+    mixture_variances = variances[indicators]
+    return indicators, mixture_means, mixture_variances, z
+
+
+def draw_H_given_structural_residuals_mixture_Phi(
+    E,
+    mixture_means,
+    mixture_variances,
+    Phi,
+    rng,
+    *,
+    h0_mean=None,
+    h0_variance_scale: float = 10.0,
+    small_constant: float = 1e-8,
+    diagnostics: dict | None = None,
+):
+    E = np.asarray(E, dtype=float)
+    T, n = E.shape
+    z = np.log(E**2 + small_constant)
+    y_tilde = z - mixture_means
+    Phi = ensure_positive_definite(Phi)
+    if h0_mean is None:
+        h0_mean = np.log(np.maximum(np.nanvar(E, axis=0, ddof=1), 1e-6))
+    h0_mean = np.asarray(h0_mean, dtype=float)
+    h0_cov = h0_variance_scale * np.eye(n)
+    filtered_means = np.zeros((T, n))
+    filtered_covs = np.zeros((T, n, n))
+    a = h0_mean.copy()
+    P = h0_cov + Phi
+    for t in range(T):
+        R = np.diag(np.maximum(mixture_variances[t], 1e-8))
+        Q = ensure_positive_definite(P + R)
+        K_gain = np.linalg.solve(Q.T, P.T).T
+        innovation = y_tilde[t] - a
+        m = a + K_gain @ innovation
+        C = ensure_positive_definite(P - K_gain @ Q @ K_gain.T)
+        filtered_means[t] = m
+        filtered_covs[t] = C
+        a = m
+        P = C + Phi
+    H_draw = np.zeros((T, n))
+    H_draw[-1] = draw_mvn_cov(filtered_means[-1], filtered_covs[-1], rng, diagnostics=diagnostics)
+    for t in range(T - 2, -1, -1):
+        S = ensure_positive_definite(filtered_covs[t] + Phi)
+        J = np.linalg.solve(S.T, filtered_covs[t].T).T
+        mean = filtered_means[t] + J @ (H_draw[t + 1] - filtered_means[t])
+        covariance = ensure_positive_definite(filtered_covs[t] - J @ S @ J.T)
+        H_draw[t] = draw_mvn_cov(mean, covariance, rng, diagnostics=diagnostics)
+    return H_draw
+
+
+def draw_Phi_given_H(H, rng, *, diagnostics: dict | None = None):
+    H = np.asarray(H, dtype=float)
+    n = H.shape[1]
+    differences = np.diff(H, axis=0)
+    df0 = n + 3
+    S0 = 0.05 * (n + 3) * np.eye(n)
+    df_post = df0 + differences.shape[0]
+    S_post = S0 + differences.T @ differences
+    return inverse_wishart_draw(df_post, S_post, rng, diagnostics=diagnostics)
+
+
+def am_bvar_sv_log_likelihood_proxy(Y, X, B, A, H):
+    U = Y - X @ B
+    E = U @ A.T
+    h = np.clip(H, -50.0, 50.0)
+    return float(-0.5 * np.sum(math.log(2.0 * math.pi) + h + (E**2) / np.exp(h)))
+
+
+def fit_am_bvar_sv_gibbs(
+    train_df,
+    p: int = P_LAGS,
+    variables=VAR_ORDER,
+    n_iter: int = 12000,
+    burn: int = 2000,
+    thin: int = 1,
+    seed: int = 20260519,
+    store_h_path: bool = False,
+    use_adaptive_minnesota: bool = True,
+    verbose: bool = False,
+):
+    if n_iter <= burn:
+        raise ValueError("n_iter must exceed burn")
+    if thin <= 0:
+        raise ValueError("thin must be positive")
+    rng = np.random.default_rng(seed)
+    init = initialize_am_bvar_sv(train_df, p=p, variables=variables)
+    X = init["x"]
+    Y = init["target"]
+    residual_variances = init["residual_variances"]
+    T, k = X.shape
+    n = Y.shape[1]
+    retained = (n_iter - burn) // thin
+    if retained <= 0:
+        raise ValueError("No posterior draws retained; reduce burn or thin")
+
+    B = init["B"].copy()
+    A = init["A"].copy()
+    H = init["H"].copy()
+    Phi = init["Phi"].copy()
+    kappa = init["kappa"].copy()
+    proposal_sd = np.array([0.10, 0.10], dtype=float)
+    diagnostics = {
+        "cholesky_jitter_events": 0,
+        "kappa_accepts": 0,
+        "kappa_attempts": 0,
+        "post_burn_kappa_accepts": 0,
+        "post_burn_kappa_attempts": 0,
+        "n_iter": int(n_iter),
+        "burn": int(burn),
+        "thin": int(thin),
+    }
+    B_draws = np.zeros((retained, k, n))
+    A_draws = np.zeros((retained, n, n))
+    H_T_draws = np.zeros((retained, n))
+    Phi_draws = np.zeros((retained, n, n))
+    kappa_draws = np.zeros((retained, 2))
+    loglik_draws = np.zeros(retained)
+    H_draws = np.zeros((retained, T, n)) if store_h_path else None
+
+    store_idx = 0
+    window_attempts = 0
+    window_accepts = 0
+    for iteration in range(1, n_iter + 1):
+        B = draw_B_given_A_H_kappa(
+            X,
+            Y,
+            A,
+            H,
+            kappa,
+            residual_variances,
+            rng,
+            p=p,
+            use_adaptive_minnesota=use_adaptive_minnesota,
+            diagnostics=diagnostics,
+        )
+        U = Y - X @ B
+        A = draw_A_given_B_H(X, Y, B, H, rng, diagnostics=diagnostics)
+        E = U @ A.T
+        _, mixture_means, mixture_variances, _ = draw_sv_mixture_indicators(E, H, rng)
+        H = draw_H_given_structural_residuals_mixture_Phi(
+            E,
+            mixture_means,
+            mixture_variances,
+            Phi,
+            rng,
+            diagnostics=diagnostics,
+        )
+        Phi = draw_Phi_given_H(H, rng, diagnostics=diagnostics)
+        if use_adaptive_minnesota:
+            kappa, accepted = draw_kappa_given_B(
+                B,
+                residual_variances,
+                kappa,
+                rng,
+                p=p,
+                proposal_sd=proposal_sd,
+            )
+        else:
+            accepted = False
+        diagnostics["kappa_attempts"] += 1
+        diagnostics["kappa_accepts"] += int(accepted)
+        window_attempts += 1
+        window_accepts += int(accepted)
+        if iteration > burn:
+            diagnostics["post_burn_kappa_attempts"] += 1
+            diagnostics["post_burn_kappa_accepts"] += int(accepted)
+        if iteration <= burn and iteration % 100 == 0 and use_adaptive_minnesota and window_attempts:
+            rate = window_accepts / window_attempts
+            if rate < 0.20:
+                proposal_sd *= 0.85
+            elif rate > 0.45:
+                proposal_sd *= 1.15
+            proposal_sd = np.clip(proposal_sd, 0.02, 0.40)
+            window_attempts = 0
+            window_accepts = 0
+        if iteration > burn and ((iteration - burn) % thin == 0):
+            B_draws[store_idx] = B
+            A_draws[store_idx] = A
+            H_T_draws[store_idx] = H[-1]
+            Phi_draws[store_idx] = Phi
+            kappa_draws[store_idx] = kappa
+            loglik_draws[store_idx] = am_bvar_sv_log_likelihood_proxy(Y, X, B, A, H)
+            if H_draws is not None:
+                H_draws[store_idx] = H
+            store_idx += 1
+        if verbose and (iteration == 1 or iteration % 500 == 0 or iteration == n_iter):
+            accept_rate = diagnostics["kappa_accepts"] / max(diagnostics["kappa_attempts"], 1)
+            print(
+                f"Gibbs iteration {iteration:>6}/{n_iter}: retained={store_idx}, "
+                f"kappa=({kappa[0]:.4f}, {kappa[1]:.5f}), accept={accept_rate:.2f}"
+            )
+
+    diagnostics["kappa_acceptance_rate"] = diagnostics["kappa_accepts"] / max(diagnostics["kappa_attempts"], 1)
+    diagnostics["post_burn_kappa_acceptance_rate"] = diagnostics["post_burn_kappa_accepts"] / max(
+        diagnostics["post_burn_kappa_attempts"],
+        1,
+    )
+    diagnostics["final_kappa_proposal_sd_1"] = float(proposal_sd[0])
+    diagnostics["final_kappa_proposal_sd_2"] = float(proposal_sd[1])
+    beta_mean = B_draws.mean(axis=0)
+    out = {
+        "p": p,
+        "variables": list(variables),
+        "periods": init["periods"],
+        "B_draws": B_draws,
+        "A_draws": A_draws,
+        "H_T_draws": H_T_draws,
+        "Phi_draws": Phi_draws,
+        "kappa_draws": kappa_draws,
+        "loglik_draws": loglik_draws,
+        "beta_mean": beta_mean,
+        "A_mean": A_draws.mean(axis=0),
+        "Phi_mean": Phi_draws.mean(axis=0),
+        "H_T_mean": H_T_draws.mean(axis=0),
+        "residual_variances": residual_variances,
+        "diagnostics": diagnostics,
+        "n_iter": int(n_iter),
+        "burn": int(burn),
+        "thin": int(thin),
+        "retained_draws": int(retained),
+        "train_last_period": train_df.index[-1],
+    }
+    if H_draws is not None:
+        out["H_draws"] = H_draws
+    return out
+
+
+def forecast_am_bvar_sv_from_gibbs_draws(
+    train_df: pd.DataFrame,
+    posterior_draws: dict,
+    horizon: int,
+    *,
+    trajectories_per_draw: int = 5,
+    seed: int = 20260519,
+    rng=None,
+    return_draws: bool = False,
+):
+    variables = list(posterior_draws.get("variables", VAR_ORDER))
+    rng = np.random.default_rng(seed) if rng is None else rng
+    history0 = train_df[variables].dropna(how="any").to_numpy(dtype=float)
+    B_draws = posterior_draws["B_draws"]
+    A_draws = posterior_draws["A_draws"]
+    H_T_draws = posterior_draws["H_T_draws"]
+    Phi_draws = posterior_draws["Phi_draws"]
+    retained, _, n = B_draws.shape
+    total_draws = retained * int(trajectories_per_draw)
+    forecast_draws = np.zeros((total_draws, horizon, n))
+    draw_index = 0
+    for m in range(retained):
+        B = B_draws[m]
+        A = A_draws[m]
+        Phi = ensure_positive_definite(Phi_draws[m])
+        phi_chol = cholesky_psd(Phi)
+        for _ in range(int(trajectories_per_draw)):
+            history = history0.copy()
+            h_current = H_T_draws[m].copy()
+            for h in range(horizon):
+                h_current = h_current + phi_chol @ rng.standard_normal(n)
+                structural_shock = np.exp(0.5 * np.clip(h_current, -50.0, 50.0)) * rng.standard_normal(n)
+                reduced_form_shock = np.linalg.solve(A, structural_shock)
+                row = lagged_forecast_row(history, posterior_draws["p"])
+                y_next = row @ B + reduced_form_shock
+                forecast_draws[draw_index, h, :] = y_next
+                history = np.vstack([history, y_next])
+            draw_index += 1
+    result = {
+        "model": posterior_draws,
+        "mean": forecast_draws.mean(axis=0),
+        "trajectories_per_draw": int(trajectories_per_draw),
+    }
+    if return_draws:
+        result["draws"] = forecast_draws
+    return result
+
+
+def summarize_am_bvar_sv_draws(
+    posterior_draws: dict,
+    *,
+    origin=None,
+    model_name: str = "AM-BVAR-SV",
+    model_system: str | None = None,
+    trajectories_per_draw: int | None = None,
+):
+    variables = list(posterior_draws["variables"])
+    kappa_draws = posterior_draws["kappa_draws"]
+    Phi_draws = posterior_draws["Phi_draws"]
+    A_draws = posterior_draws["A_draws"]
+    diagnostics = posterior_draws.get("diagnostics", {})
+    row = {
+        "origin": str(origin) if origin is not None else str(posterior_draws.get("train_last_period", "")),
+        "model": model_name,
+        "model_system": model_system or f"{len(variables)}_variable_system",
+        "n_variables": len(variables),
+        "variables": ", ".join(variables),
+        "retained_draws": int(posterior_draws["retained_draws"]),
+        "burn": int(posterior_draws["burn"]),
+        "thin": int(posterior_draws["thin"]),
+        "trajectories_per_draw": int(trajectories_per_draw) if trajectories_per_draw is not None else np.nan,
+        "mean_kappa_1": float(np.mean(kappa_draws[:, 0])),
+        "median_kappa_1": float(np.median(kappa_draws[:, 0])),
+        "p05_kappa_1": float(np.quantile(kappa_draws[:, 0], 0.05)),
+        "p95_kappa_1": float(np.quantile(kappa_draws[:, 0], 0.95)),
+        "mean_kappa_2": float(np.mean(kappa_draws[:, 1])),
+        "median_kappa_2": float(np.median(kappa_draws[:, 1])),
+        "p05_kappa_2": float(np.quantile(kappa_draws[:, 1], 0.05)),
+        "p95_kappa_2": float(np.quantile(kappa_draws[:, 1], 0.95)),
+        "kappa_acceptance_rate": float(diagnostics.get("post_burn_kappa_acceptance_rate", diagnostics.get("kappa_acceptance_rate", np.nan))),
+        "cholesky_jitter_events": int(diagnostics.get("cholesky_jitter_events", 0)),
+        "mean_log_likelihood_proxy": float(np.mean(posterior_draws["loglik_draws"])),
+    }
+    for i in range(len(variables)):
+        row[f"mean_phi_{i + 1}{i + 1}"] = float(np.mean(Phi_draws[:, i, i]))
+    for i in range(1, len(variables)):
+        for j in range(i):
+            row[f"mean_a{i + 1}{j + 1}"] = float(np.mean(A_draws[:, i, j]))
+    mean_phi = ensure_positive_definite(np.mean(Phi_draws, axis=0))
+    phi_sd = np.sqrt(np.clip(np.diag(mean_phi), 1e-12, None))
+    phi_corr = mean_phi / np.outer(phi_sd, phi_sd)
+    for i in range(1, len(variables)):
+        for j in range(i):
+            row[f"mean_phi_corr_{i + 1}{j + 1}"] = float(phi_corr[i, j])
+    accept_rate = row["kappa_acceptance_rate"]
+    finite_checks = np.all(np.isfinite(kappa_draws)) and np.all(np.isfinite(Phi_draws)) and np.all(np.isfinite(A_draws))
+    row["convergence_flag"] = "ok" if finite_checks and (0.05 <= accept_rate <= 0.80) else "check"
+    return row
+
+
+def am_bvar_sv_trace_dataframe(posterior_draws: dict) -> pd.DataFrame:
+    variables = list(posterior_draws["variables"])
+    retained = posterior_draws["retained_draws"]
+    data = {
+        "draw": np.arange(1, retained + 1),
+        "kappa_1": posterior_draws["kappa_draws"][:, 0],
+        "kappa_2": posterior_draws["kappa_draws"][:, 1],
+        "log_likelihood_proxy": posterior_draws["loglik_draws"],
+    }
+    Phi = posterior_draws["Phi_draws"]
+    A = posterior_draws["A_draws"]
+    for i, var in enumerate(variables):
+        data[f"phi_{var}"] = Phi[:, i, i]
+    for i in range(1, len(variables)):
+        for j in range(i):
+            data[f"a{i + 1}{j + 1}"] = A[:, i, j]
+    return pd.DataFrame(data)
+
+
+def summarize_am_bvar_sv_volatility(posterior_draws: dict) -> pd.DataFrame:
+    if "H_draws" not in posterior_draws:
+        return pd.DataFrame()
+    H_draws = posterior_draws["H_draws"]
+    periods = posterior_draws["periods"]
+    variables = posterior_draws["variables"]
+    volatility = np.exp(0.5 * np.clip(H_draws, -50.0, 50.0))
+    rows = []
+    for t, period in enumerate(periods):
+        for j, var in enumerate(variables):
+            values = volatility[:, t, j]
+            rows.append(
+                {
+                    "quarter": str(period),
+                    "variable": var,
+                    "variable_name": VAR_LABELS[var],
+                    "median_volatility": float(np.quantile(values, 0.50)),
+                    "p16_volatility": float(np.quantile(values, 0.16)),
+                    "p84_volatility": float(np.quantile(values, 0.84)),
+                    "p05_volatility": float(np.quantile(values, 0.05)),
+                    "p95_volatility": float(np.quantile(values, 0.95)),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def fit_bvar_minnesota_sv(
     train_df: pd.DataFrame,
     p: int = P_LAGS,
@@ -888,7 +1560,10 @@ def run_recursive_evaluation(
     horizons,
     *,
     seed: int = 20260519,
-    bvar_draws: int = 600,
+    bvar_n_iter: int = DEFAULT_GIBBS_N_ITER_RECURSIVE,
+    bvar_burn: int = DEFAULT_GIBBS_BURN_RECURSIVE,
+    bvar_thin: int = DEFAULT_GIBBS_THIN_RECURSIVE,
+    bvar_trajectories_per_draw: int = DEFAULT_GIBBS_TRAJECTORIES_RECURSIVE,
     ucsv_particles: int = 500,
     ucsv_draws: int = 500,
     progress: bool = True,
@@ -897,15 +1572,30 @@ def run_recursive_evaluation(
     max_h = max(horizons)
     origins = recursive_origins(growth_df, first_origin, min_horizon=1)
     records = []
-    lambda_records = []
+    hyperparameter_records = []
     total = len(origins)
     for idx, origin in enumerate(origins, start=1):
         train = growth_df.loc[:origin, VAR_ORDER]
         if progress and (idx == 1 or idx % 5 == 0 or idx == total):
             print(f"Origin {idx:>3}/{total}: {origin}, train n={len(train)}")
 
-        bvar_model = fit_bvar_minnesota_sv(train, p=P_LAGS)
-        bvar_result = forecast_bvar_sv(train, horizon=max_h, draws=bvar_draws, rng=rng, model=bvar_model)
+        origin_seed = seed + idx * 1000
+        bvar_model = fit_am_bvar_sv_gibbs(
+            train,
+            p=P_LAGS,
+            variables=VAR_ORDER,
+            n_iter=bvar_n_iter,
+            burn=bvar_burn,
+            thin=bvar_thin,
+            seed=origin_seed,
+        )
+        bvar_result = forecast_am_bvar_sv_from_gibbs_draws(
+            train,
+            posterior_draws=bvar_model,
+            horizon=max_h,
+            trajectories_per_draw=bvar_trajectories_per_draw,
+            seed=origin_seed + 100000,
+        )
         ar_forecast = forecast_ar_panel(train, max_horizon=max_h, p=P_LAGS)
         ucsv_forecast = forecast_ucsv_panel(
             train,
@@ -918,18 +1608,20 @@ def run_recursive_evaluation(
         records.extend(forecasts_to_records("AM-BVAR-SV", origin, bvar_result["mean"], growth_df))
         records.extend(forecasts_to_records("AR(4)", origin, ar_forecast, growth_df))
         records.extend(forecasts_to_records("UC-SV", origin, ucsv_forecast, growth_df))
-        lambda_records.append(
-            {
-                "origin": str(origin),
-                "selected_lambda": bvar_model["lambda"],
-                "log_marginal_likelihood": bvar_model["log_marginal_likelihood"],
-            }
+        hyperparameter_records.append(
+            summarize_am_bvar_sv_draws(
+                bvar_model,
+                origin=origin,
+                model_name="AM-BVAR-SV",
+                model_system="five_variable_with_wage",
+                trajectories_per_draw=bvar_trajectories_per_draw,
+            )
         )
 
     forecast_df = pd.DataFrame(records)
     forecast_df = forecast_df[forecast_df["horizon"].isin(horizons)].reset_index(drop=True)
-    lambda_df = pd.DataFrame(lambda_records)
-    return forecast_df, lambda_df
+    hyperparameter_df = pd.DataFrame(hyperparameter_records)
+    return forecast_df, hyperparameter_df
 
 
 def compute_rmse_table(forecast_df: pd.DataFrame):
@@ -1178,14 +1870,16 @@ def run_wage_growth_predictive_power_evaluation(
     horizons,
     *,
     seed: int = 20260519,
-    bvar_draws: int = 600,
+    bvar_n_iter: int = DEFAULT_GIBBS_N_ITER_RECURSIVE,
+    bvar_burn: int = DEFAULT_GIBBS_BURN_RECURSIVE,
+    bvar_thin: int = DEFAULT_GIBBS_THIN_RECURSIVE,
+    bvar_trajectories_per_draw: int = DEFAULT_GIBBS_TRAJECTORIES_RECURSIVE,
     progress: bool = True,
 ):
-    rng = np.random.default_rng(seed)
     max_h = max(horizons)
     origins = recursive_origins(growth_df[VAR_ORDER].dropna(how="any"), first_origin, min_horizon=1)
     records = []
-    lambda_records = []
+    hyperparameter_records = []
     total = len(origins)
     for idx, origin in enumerate(origins, start=1):
         train_with_wage = growth_df.loc[:origin, VAR_ORDER]
@@ -1193,21 +1887,38 @@ def run_wage_growth_predictive_power_evaluation(
         if progress and (idx == 1 or idx % 5 == 0 or idx == total):
             print(f"Wage extension origin {idx:>3}/{total}: {origin}, train n={len(train_with_wage)}")
 
-        model_with_wage = fit_bvar_minnesota_sv(train_with_wage, p=P_LAGS, variables=VAR_ORDER)
-        forecast_with_wage = forecast_bvar_sv(
+        origin_seed = seed + idx * 2000
+        model_with_wage = fit_am_bvar_sv_gibbs(
             train_with_wage,
-            horizon=max_h,
-            draws=bvar_draws,
-            rng=rng,
-            model=model_with_wage,
+            p=P_LAGS,
+            variables=VAR_ORDER,
+            n_iter=bvar_n_iter,
+            burn=bvar_burn,
+            thin=bvar_thin,
+            seed=origin_seed,
         )
-        model_without_wage = fit_bvar_minnesota_sv(train_without_wage, p=P_LAGS, variables=NO_WAGE_VAR_ORDER)
-        forecast_without_wage = forecast_bvar_sv(
-            train_without_wage,
+        forecast_with_wage = forecast_am_bvar_sv_from_gibbs_draws(
+            train_with_wage,
+            posterior_draws=model_with_wage,
             horizon=max_h,
-            draws=bvar_draws,
-            rng=rng,
-            model=model_without_wage,
+            trajectories_per_draw=bvar_trajectories_per_draw,
+            seed=origin_seed + 100000,
+        )
+        model_without_wage = fit_am_bvar_sv_gibbs(
+            train_without_wage,
+            p=P_LAGS,
+            variables=NO_WAGE_VAR_ORDER,
+            n_iter=bvar_n_iter,
+            burn=bvar_burn,
+            thin=bvar_thin,
+            seed=origin_seed + 500,
+        )
+        forecast_without_wage = forecast_am_bvar_sv_from_gibbs_draws(
+            train_without_wage,
+            posterior_draws=model_without_wage,
+            horizon=max_h,
+            trajectories_per_draw=bvar_trajectories_per_draw,
+            seed=origin_seed + 100500,
         )
 
         with_wage_records = forecasts_to_records(
@@ -1227,33 +1938,29 @@ def run_wage_growth_predictive_power_evaluation(
                 variables=NO_WAGE_VAR_ORDER,
             )
         )
-        lambda_records.extend(
+        hyperparameter_records.extend(
             [
-                {
-                    "origin": str(origin),
-                    "model": WAGE_MODEL_NAME,
-                    "model_system": "five_variable_with_wage",
-                    "n_variables": len(VAR_ORDER),
-                    "variables": ", ".join(VAR_ORDER),
-                    "selected_lambda": model_with_wage["lambda"],
-                    "log_marginal_likelihood": model_with_wage["log_marginal_likelihood"],
-                },
-                {
-                    "origin": str(origin),
-                    "model": NO_WAGE_MODEL_NAME,
-                    "model_system": "four_variable_without_wage",
-                    "n_variables": len(NO_WAGE_VAR_ORDER),
-                    "variables": ", ".join(NO_WAGE_VAR_ORDER),
-                    "selected_lambda": model_without_wage["lambda"],
-                    "log_marginal_likelihood": model_without_wage["log_marginal_likelihood"],
-                },
+                summarize_am_bvar_sv_draws(
+                    model_with_wage,
+                    origin=origin,
+                    model_name=WAGE_MODEL_NAME,
+                    model_system="five_variable_with_wage",
+                    trajectories_per_draw=bvar_trajectories_per_draw,
+                ),
+                summarize_am_bvar_sv_draws(
+                    model_without_wage,
+                    origin=origin,
+                    model_name=NO_WAGE_MODEL_NAME,
+                    model_system="four_variable_without_wage",
+                    trajectories_per_draw=bvar_trajectories_per_draw,
+                ),
             ]
         )
 
     forecast_df = pd.DataFrame(records)
     forecast_df = forecast_df[forecast_df["horizon"].isin(horizons)].reset_index(drop=True)
-    lambda_df = pd.DataFrame(lambda_records)
-    return forecast_df, lambda_df
+    hyperparameter_df = pd.DataFrame(hyperparameter_records)
+    return forecast_df, hyperparameter_df
 
 
 def reconstruct_recursive_index_paths(index_df: pd.DataFrame, forecast_df: pd.DataFrame):
@@ -1352,7 +2059,10 @@ def fit_final_forecasts(
     *,
     seed: int = 20260519,
     forecast_horizon: int = 7,
-    bvar_draws: int = 5000,
+    bvar_n_iter: int = DEFAULT_GIBBS_N_ITER_FINAL,
+    bvar_burn: int = DEFAULT_GIBBS_BURN_FINAL,
+    bvar_thin: int = DEFAULT_GIBBS_THIN_FINAL,
+    bvar_trajectories_per_draw: int = DEFAULT_GIBBS_TRAJECTORIES_FINAL,
     ucsv_particles: int = 2500,
     ucsv_draws: int = 5000,
 ):
@@ -1362,13 +2072,23 @@ def fit_final_forecasts(
     anchor_levels = index_levels.loc[latest_common_quarter, VAR_ORDER].to_numpy(dtype=float)
     rng_final = np.random.default_rng(seed + 999)
 
-    final_bvar_model = fit_bvar_minnesota_sv(full_train, p=P_LAGS)
-    final_bvar = forecast_bvar_sv(
+    final_bvar_model = fit_am_bvar_sv_gibbs(
         full_train,
+        p=P_LAGS,
+        variables=VAR_ORDER,
+        n_iter=bvar_n_iter,
+        burn=bvar_burn,
+        thin=bvar_thin,
+        seed=seed + 777,
+        store_h_path=True,
+        verbose=False,
+    )
+    final_bvar = forecast_am_bvar_sv_from_gibbs_draws(
+        full_train,
+        posterior_draws=final_bvar_model,
         horizon=forecast_horizon,
-        draws=bvar_draws,
-        rng=rng_final,
-        model=final_bvar_model,
+        trajectories_per_draw=bvar_trajectories_per_draw,
+        seed=seed + 888,
         return_draws=True,
     )
     final_ar_mean = forecast_ar_panel(full_train, max_horizon=forecast_horizon, p=P_LAGS)
